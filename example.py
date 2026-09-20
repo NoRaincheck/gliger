@@ -13,10 +13,10 @@ enabling efficient processing of multiple texts and questions in a single forwar
 See: https://docs.typesafe.ai/introduction/quickstart
 """
 
-from gliclass import GLiClassModel, ZeroShotClassificationPipeline
-from transformers import AutoTokenizer
 import torch
 import torch.nn.functional as F
+from gliclass import GLiClassModel, ZeroShotClassificationPipeline
+from transformers import AutoTokenizer
 
 # Model configuration
 MODEL_ID = "knowledgator/gliclass-large-v1.0"
@@ -373,6 +373,7 @@ def jev_api(
             if isinstance(criteria, dict):
                 hierarchical_labels[name] = list(criteria.keys())
             else:
+                assert isinstance(criteria, list)
                 hierarchical_labels[name] = criteria
         elif q_type == "noul":
             hierarchical_labels[name] = ["yes", "no"]
@@ -381,6 +382,7 @@ def jev_api(
             if isinstance(criteria, dict):
                 hierarchical_labels[name] = list(criteria.keys())
             else:
+                assert isinstance(criteria, list)
                 hierarchical_labels[name] = criteria
         else:
             raise ValueError(f"Unknown question type: {q_type}")
@@ -406,7 +408,6 @@ def jev_api(
     per_text_answers: list[dict[str, dict]] = []
 
     for logits in logits_list:
-        flat_probs = softmax(logits)
         group_rescales = per_group_rescale(logits, flat_labels, label_to_group)
 
         text_answers: dict[str, dict] = {}

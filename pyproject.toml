@@ -9,12 +9,13 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "gliclass>=0.1.20",
-    "pydantic>=2.13.5",
 ]
 
-[project.scripts]
-gliger = "gliger:main"
+[tool.ruff]
+line-length = 120
 
-[build-system]
-requires = ["uv_build>=0.12.1,<0.13.0"]
-build-backend = "uv_build"
+[dependency-groups]
+dev = [
+    "ruff>=0.16.8",
+    "ty>=0.0.82",
+]
