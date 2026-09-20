@@ -1,0 +1,19 @@
+[project]
+name = "gliger"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "NoRaincheck", email = "2498638+NoRaincheck@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "gliclass>=0.1.20",
+]
+
+[project.scripts]
+gliger = "gliger:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
