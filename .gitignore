@@ -1,8 +1,6 @@
-```gitignore
 # Python cache
 __pycache__/
 *.pyc
 
 # Original rules preserved
 *.log
-```
