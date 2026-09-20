@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 # ── model setup ───────────────────────────────────────────────────────────────
-model_id = "knowledgator/gliclass-base-v1.0"  # Use base variant for memory-constrained environments
+model_id = "knowledgator/gliclass-large-v1.0"
 
 model = GLiClassModel.from_pretrained(model_id)
 tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -311,9 +311,13 @@ def jev_api(
             group_probs = group_rescales[name]
 
             if q_type == "choice":
-                flat_labels_for_group = [l for l in flat_labels if label_to_group[l] == name]
+                flat_labels_for_group = [
+                    l for l in flat_labels if label_to_group[l] == name
+                ]
                 choice_key = int(group_probs.argmax().item())
-                choice_label = flat_labels_for_group[choice_key].split(".")[-1]  # strip group prefix
+                choice_label = flat_labels_for_group[choice_key].split(".")[
+                    -1
+                ]  # strip group prefix
                 probs = {
                     flat_labels_for_group[i].split(".")[-1]: float(group_probs[i])
                     for i in range(len(group_probs))
@@ -348,7 +352,10 @@ def jev_api(
                     "type": "score",
                     "score": float(score_idx),
                     "confidence": confidence,
-                    "legend": {str(i): hierarchical_labels[name][i] for i in range(len(hierarchical_labels[name]))},
+                    "legend": {
+                        str(i): hierarchical_labels[name][i]
+                        for i in range(len(hierarchical_labels[name]))
+                    },
                     "probabilities": probs,
                 }
 
