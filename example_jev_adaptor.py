@@ -173,7 +173,35 @@ def adapt_noul(
     return answers
 
 
-# ── Score primitive (ordered categorical, batched) ───────────────────────────
+def _score_from_rank(
+    probs: torch.Tensor,
+) -> tuple[float, float]:
+    """Compute a fractional ordinal score from a tensor of class probabilities.
+
+    Ranks classes by probability (descending), then computes a weighted
+    score where each level index is weighted by its rank-adjusted
+    probability contribution. Confidence is the maximum class probability.
+
+    Args:
+        probs: 1-D tensor of softmax probabilities for ordered levels.
+
+    Returns:
+        A tuple of (fractional_score, confidence) both as Python floats.
+    """
+    ranked = sorted(enumerate(probs.tolist()), key=lambda x: x[1], reverse=True)
+    weighted_sum = 0.0
+    score = 0.0
+    for level_idx, prob in ranked:
+        weight = level_idx * prob
+        weighted_sum += weight
+        current_weight_prop = weight / weighted_sum
+
+        score = level_idx * (current_weight_prop) + score * (1 - current_weight_prop)
+
+    return float(score), float(probs.max())
+
+
+# ── Score primitive (ordered categorical, batched) ────────────────────────────
 def adapt_score(
     texts: list[str],
     instructions: str | list[str],
@@ -184,6 +212,10 @@ def adapt_score(
 
     All texts share the same labels (criteria) and are processed in a single
     GLiClass forward pass via the batch ``get_embeddings`` interface.
+
+    The ordinal score is a **fractional** value computed via reciprocal-rank
+    weighting: the most probable level (rank 1) gets weight 1, the next
+    (rank 2) gets weight 1/2, etc., each multiplied by its probability.
     """
     labels = criteria  # e.g. ["Calm", "Frustrated", "Very angry"]
     if isinstance(instructions, str):
@@ -195,12 +227,12 @@ def adapt_score(
     answers = []
     for logits in logits_list:
         probs = softmax(logits)
-        score_idx = int(probs.argmax().item())
+        score, confidence = _score_from_rank(probs)
         answers.append(
             {
                 "type": "score",
-                "score": float(score_idx),
-                "confidence": float(probs.max()),
+                "score": score,
+                "confidence": confidence,
                 "legend": legend,
                 "probabilities": {str(i): float(probs[i]) for i in range(len(probs))},
             }
@@ -209,7 +241,7 @@ def adapt_score(
     return answers
 
 
-# ── Unified Jev API (TypeSafe contract, batched) ─────────────────────────────
+# ── Unified Jev API (fully batched in one forward pass) ──────────────────────
 def jev_api(
     texts: list[str],
     questions: dict[str, dict],
@@ -217,8 +249,8 @@ def jev_api(
 ) -> list[dict]:
     """Unified entry point matching the Typesafe API request/response contract.
 
-    All texts for a given question type are batched into a single GLiClass
-    forward pass via the batch ``get_embeddings`` interface.
+    All texts and ALL questions are batched into a SINGLE GLiClass forward pass
+    via the batch ``get_embeddings`` interface with hierarchical labels.
 
     Request shape:
         {
@@ -254,49 +286,111 @@ def jev_api(
             ...
         ]
     """
-    # Build per-text answer dicts
-    per_text_answers: list[dict[str, dict]] = [{} for _ in texts]
+    # Build unified hierarchical labels: {question_name: [answer_options, ...]}
+    hierarchical_labels: dict[str, list[str]] = {}
+    question_meta: dict[str, dict] = {}  # store type + instructions per question
 
     for name, question in questions.items():
         q_type = question["type"]
-        instructions = question["instructions"]
         criteria = question.get("criteria")
+        instructions = question["instructions"]
 
         if q_type == "choice":
-            # Convert flat dict {label: desc} to hierarchical {group: [labels]}
+            # criteria is dict {label: desc} or hierarchical
             if isinstance(criteria, dict):
-                hierarchical = {name: list(criteria.keys())}
+                hierarchical_labels[name] = list(criteria.keys())
             else:
-                hierarchical = criteria
-
-            results = adapt_choice(texts, hierarchical, examples)
-            for i, result in enumerate(results):
-                ans = result["answers"].get(name, {})
-                # Flatten the dot-notation label names back to bare labels
-                if ans:
-                    flat_probs = {
-                        k.split(".")[-1]: v
-                        for k, v in ans.get("probabilities", {}).items()
-                    }
-                    ans["probabilities"] = flat_probs
-                    ans["choice"] = ans["choice"].split(".")[-1]
-                per_text_answers[i][name] = ans
-
+                hierarchical_labels[name] = criteria
         elif q_type == "noul":
-            batch_answers = adapt_noul(texts, instructions, examples)
-            for i, ans in enumerate(batch_answers):
-                per_text_answers[i][name] = ans
-
+            hierarchical_labels[name] = ["yes", "no"]
         elif q_type == "score":
-            # Convert flat dict {label: desc} → list of keys
+            # criteria is list or dict
             if isinstance(criteria, dict):
-                criteria = list(criteria.keys())
-            batch_answers = adapt_score(texts, instructions, criteria, examples)
-            for i, ans in enumerate(batch_answers):
-                per_text_answers[i][name] = ans
-
+                hierarchical_labels[name] = list(criteria.keys())
+            else:
+                hierarchical_labels[name] = criteria
         else:
             raise ValueError(f"Unknown question type: {q_type}")
+
+        question_meta[name] = {
+            "type": q_type,
+            "instructions": instructions,
+        }
+
+    # Single batched GLiClass call for ALL texts and ALL questions
+    flat_labels, label_to_group = flatten_with_groups(hierarchical_labels)
+
+    # Build unified prompt that includes all instructions
+    # Format: "Q1: <instr1> | Q2: <instr2> | ..."
+    unified_instructions = " | ".join(
+        f"{name}: {meta['instructions']}" for name, meta in question_meta.items()
+    )
+    prompts = [unified_instructions] * len(texts)
+
+    logits_list = get_logits(texts, flat_labels, prompt=prompts, examples=examples)
+
+    # Post-process results
+    per_text_answers: list[dict[str, dict]] = []
+
+    for logits in logits_list:
+        flat_probs = softmax(logits)
+        group_rescales = per_group_rescale(logits, flat_labels, label_to_group)
+
+        text_answers: dict[str, dict] = {}
+
+        for name, meta in question_meta.items():
+            q_type = meta["type"]
+            group_probs = group_rescales[name]
+
+            if q_type == "choice":
+                flat_labels_for_group = [
+                    l for l in flat_labels if label_to_group[l] == name
+                ]
+                choice_key = int(group_probs.argmax().item())
+                choice_label = flat_labels_for_group[choice_key].split(".")[
+                    -1
+                ]  # strip group prefix
+                probs = {
+                    flat_labels_for_group[i].split(".")[-1]: float(group_probs[i])
+                    for i in range(len(group_probs))
+                }
+                confidence = float(group_probs.max())
+                text_answers[name] = {
+                    "type": "choice",
+                    "choice": choice_label,
+                    "confidence": confidence,
+                    "probabilities": probs,
+                }
+
+            elif q_type == "noul":
+                yes_prob = float(group_probs[0])
+                noul = 1.0 if yes_prob >= 0.5 else 0.0
+                confidence = float(group_probs.max())
+                text_answers[name] = {
+                    "type": "noul",
+                    "noul": noul,
+                    "confidence": confidence,
+                    "probabilities": {
+                        "yes": float(group_probs[0]),
+                        "no": float(group_probs[1]),
+                    },
+                }
+
+            elif q_type == "score":
+                score, confidence = _score_from_rank(group_probs)
+                probs = {str(i): float(group_probs[i]) for i in range(len(group_probs))}
+                text_answers[name] = {
+                    "type": "score",
+                    "score": score,
+                    "confidence": confidence,
+                    "legend": {
+                        str(i): hierarchical_labels[name][i]
+                        for i in range(len(hierarchical_labels[name]))
+                    },
+                    "probabilities": probs,
+                }
+
+        per_text_answers.append(text_answers)
 
     return [{"model": "jev-local", "answers": answers} for answers in per_text_answers]
 
@@ -351,7 +445,7 @@ def main() -> None:
                 )
             elif answer["type"] == "score":
                 print(
-                    f"  [{name}] score={answer['score']}, confidence={answer['confidence']:.4f}"
+                    f"  [{name}] score={answer['score']:.4f}, confidence={answer['confidence']:.4f}"
                 )
 
     print()
