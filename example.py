@@ -7,10 +7,59 @@ using GLiClass model logits. It follows the Typesafe API contract:
 - Noul    -> binary yes/no probability (0=no, 1=yes)
 - Score   -> ordered categorical (0..N with legend + probabilities)
 
-The module uses batch GLiClass inference via get_embeddings for all three primitives,
+The module uses batch GLiClass inference via ``get_embeddings`` for all three primitives,
 enabling efficient processing of multiple texts and questions in a single forward pass.
 
 See: https://docs.typesafe.ai/introduction/quickstart
+
+
+Durable Design Decisions
+=========================
+
+1. **Single-batch inference**
+   All texts and all questions are folded into one hierarchical label set, flattened to
+   dot-notation (``group.label``), and classified in a single GLiClass forward pass.
+   This avoids N+1 calls and lets the model attend across all decision dimensions
+   simultaneously.
+
+2. **Per-group renormalization**
+   After the batch pass, raw logits are split by group and renormalized with softmax
+   *within* each group. This produces properly calibrated per-question probabilities
+   even though the model saw all labels in one pass.
+
+3. **Score: fractional ordinal via reciprocal-rank weighting**
+   The ``_score_from_rank`` function converts a softmax probability distribution over
+   ordered levels into a single fractional score in ``[0, N-1]``. The algorithm:
+
+   a. Enumerates ``(level_index, probability)`` pairs and sorts them descending by
+      probability (rank 1 = most likely level).
+   b. Accumulates a weighted sum where each level contributes ``level_index * probability``.
+   c. At each step it computes a weight proportion:
+      ``current_weight_prop = (level_idx * prob) / weighted_sum``
+   d. It blends the current level into the running score:
+      ``score = level_idx * current_weight_prop + score * (1 - current_weight_prop)``
+   e. Returns ``(score, max_prob)`` where ``max_prob`` is the confidence.
+
+   This produces a *soft* ordinal score that reflects the full probability distribution
+   rather than a hard argmax, so a model that is "almost sure" about level 2 but has
+   meaningful probability on level 3 will yield a fractional score between 2 and 3.
+
+4. **Noul: deterministic threshold at 0.5**
+   Binary yes/no uses the raw ``yes`` probability from the group-renormalized softmax.
+   ``noul = 1.0`` when ``yes_prob >= 0.5``, otherwise ``0.0``. Confidence is the max
+   of the two class probabilities.
+
+5. **Hierarchical label flattening**
+   The ``flatten_with_groups`` helper converts ``{group: [labels]}`` into a flat list
+   of dot-notation strings (``"group.label"``) and a reverse mapping
+   ``flat_label -> group_name``. This is the format GLiClass expects for hierarchical
+   classification.
+
+6. **Unified prompt construction**
+   All question instructions are joined with ``" | "`` into a single prompt string
+   shared by every text. The model uses this context to disambiguate labels across
+   question boundaries.
+
 """
 
 import torch
