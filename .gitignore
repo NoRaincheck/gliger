@@ -1,1 +1,6 @@
-(example_jev_adaptor.py appears to be a source code file, and there are no build artifacts, dependencies, or temporary files in the changes, so no .gitignore rules are needed)
+# Python cache
+__pycache__/
+*.pyc
+
+# Original rules preserved
+*.log
