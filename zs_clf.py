@@ -54,22 +54,59 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, pipeline
 
 
-MODEL_ID: str = "tasksource/ModernBERT-base-nli"
+# Default model for zero-shot classification
+DEFAULT_MODEL_ID: str = "tasksource/ModernBERT-base-nli"
 
-# Initialize tokenizer and zero-shot classification pipeline
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-_classifier = pipeline(
-    "zero-shot-classification",
-    model=MODEL_ID,
-    tokenizer=tokenizer,
-    multi_label=True,  # return scores for ALL labels (not just top-1)
-    device_map="auto",  # auto-GPU if available
-)
+# Global cache for initialized pipelines
+_model_cache: dict[str, tuple[Any, Any, Any]] = {}
 
 
-def classifier() -> Any:
-    """Return the underlying HuggingFace zero-shot classification pipeline."""
-    return _classifier
+def _load_pipeline(
+    model_id: str = DEFAULT_MODEL_ID,
+    multi_label: bool = True,
+    device_map: str = "auto",
+) -> tuple[Any, Any, Any]:
+    """Load and cache a tokenizer + pipeline for the given model.
+
+    Args:
+        model_id: HuggingFace model identifier.
+        multi_label: Whether to return scores for all labels.
+        device_map: Device placement strategy (e.g. "auto", "cpu").
+
+    Returns:
+        Tuple of (tokenizer, pipeline, model_id) for cache keying.
+    """
+    if model_id in _model_cache:
+        return _model_cache[model_id]
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    clf = pipeline(
+        "zero-shot-classification",
+        model=model_id,
+        tokenizer=tokenizer,
+        multi_label=multi_label,
+        device_map=device_map,
+    )
+    _model_cache[model_id] = (tokenizer, clf, model_id)
+    return tokenizer, clf, model_id
+
+
+def classifier(model_id: str = DEFAULT_MODEL_ID) -> Any:
+    """Return the underlying HuggingFace zero-shot classification pipeline.
+
+    Args:
+        model_id: HuggingFace model identifier. Defaults to DEFAULT_MODEL_ID.
+
+    Returns:
+        The zero-shot classification pipeline.
+    """
+    _, clf, _ = _load_pipeline(model_id)
+    return clf
+
+
+def clear_model_cache() -> None:
+    """Clear the cached model pipelines. Useful for memory management."""
+    _model_cache.clear()
 
 
 def _softmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
