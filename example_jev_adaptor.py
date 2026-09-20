@@ -1,13 +1,16 @@
-"""
-example_jev_adaptor.py — emulate TypeSafe Choice/Noul/Score primitives using GLiClass logits.
+"""TypeSafe Choice/Noul/Score primitives emulation using GLiClass logits.
 
-Follows the Typesafe API contract (https://docs.typesafe.ai/introduction/quickstart):
+This module provides adapters that emulate TypeSafe API primitives (Choice, Noul, Score)
+using GLiClass model logits. It follows the Typesafe API contract:
 
-  - Choice  → multi-class probabilities  (per-group renormalized softmax)
-  - Noul    → binary yes/no probability  (0=no, 1=yes)
-  - Score   → ordered categorical        (0..N with legend + probabilities)
+- Choice  -> multi-class probabilities (per-group renormalized softmax)
+- Noul    -> binary yes/no probability (0=no, 1=yes)
+- Score   -> ordered categorical (0..N with legend + probabilities)
 
-Uses batch GLiClass inference via get_embeddings for all three primitives.
+The module uses batch GLiClass inference via get_embeddings for all three primitives,
+enabling efficient processing of multiple texts and questions in a single forward pass.
+
+See: https://docs.typesafe.ai/introduction/quickstart
 """
 
 from gliclass import GLiClassModel, ZeroShotClassificationPipeline
@@ -15,19 +18,31 @@ from transformers import AutoTokenizer
 import torch
 import torch.nn.functional as F
 
-# ── model setup ───────────────────────────────────────────────────────────────
-model_id = "knowledgator/gliclass-large-v1.0"
+# Model configuration
+MODEL_ID = "knowledgator/gliclass-large-v1.0"
 
-model = GLiClassModel.from_pretrained(model_id)
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+# Initialize model and pipeline
+model = GLiClassModel.from_pretrained(MODEL_ID)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
 pipeline = ZeroShotClassificationPipeline(
     model, tokenizer, classification_type="single-label"
 )
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# -- helpers ------------------------------------------------------------------─
+
+
 def softmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Apply softmax activation function to logits.
+
+    Args:
+        logits: Input tensor of raw logits.
+        dim: The dimension along which to apply softmax. Defaults to last dimension.
+
+    Returns:
+        Tensor with softmax probabilities.
+    """
     return F.softmax(logits, dim=dim)
 
 
@@ -37,7 +52,17 @@ def get_logits(
     prompt: str | list[str] | None = None,
     examples: list[dict] | None = None,
 ) -> torch.Tensor | list[torch.Tensor]:
-    """Get raw logits via get_embeddings. Supports single or batch text."""
+    """Get raw logits via get_embeddings. Supports single or batch text.
+
+    Args:
+        text: Single text string or list of texts to classify.
+        labels: List of label strings for classification.
+        prompt: Optional prompt or list of prompts to guide classification.
+        examples: Optional list of example dictionaries for few-shot learning.
+
+    Returns:
+        Single tensor of logits for one text, or list of tensors for batch input.
+    """
     emb = pipeline.get_embeddings(text, labels, prompt=prompt, examples=examples)
     if isinstance(text, str):
         return torch.tensor(emb[0]["logits"])
@@ -47,7 +72,16 @@ def get_logits(
 def flatten_with_groups(
     hierarchical_labels: dict[str, list[str]],
 ) -> tuple[list[str], dict[str, str]]:
-    """Flatten hierarchical labels to dot-notation and build label→group map."""
+    """Flatten hierarchical labels to dot-notation and build label->group map.
+
+    Args:
+        hierarchical_labels: Dictionary mapping group names to lists of labels.
+
+    Returns:
+        A tuple containing:
+            - List of flattened labels in dot-notation (e.g., "group.label")
+            - Dictionary mapping each flat label to its group name.
+    """
     flat = pipeline.flatten_labels(hierarchical_labels)
     label_to_group: dict[str, str] = {}
     for group, labels in hierarchical_labels.items():
@@ -61,7 +95,16 @@ def per_group_rescale(
     flat_labels: list[str],
     label_to_group: dict[str, str],
 ) -> dict[str, torch.Tensor]:
-    """Renormalize flat probabilities per group via softmax on the logits."""
+    """Renormalize flat probabilities per group via softmax on the logits.
+
+    Args:
+        logits: Raw logits tensor from the model.
+        flat_labels: List of flattened label strings.
+        label_to_group: Dictionary mapping each flat label to its group.
+
+    Returns:
+        Dictionary mapping group names to renormalized probability tensors.
+    """
     groups: dict[str, list[int]] = {}
     for i, label in enumerate(flat_labels):
         group = label_to_group[label]
@@ -80,7 +123,17 @@ def jev_choice_answer(
     flat_labels: list[str],
     label_to_group: dict[str, str],
 ) -> dict:
-    """Build a TypeSafe Choice-shaped answer for one group."""
+    """Build a TypeSafe Choice-shaped answer for one group.
+
+    Args:
+        group: The group name for this choice.
+        group_probs: Renormalized probability tensor for this group.
+        flat_labels: List of all flattened label strings.
+        label_to_group: Dictionary mapping flat labels to their groups.
+
+    Returns:
+        Dictionary containing type, choice, confidence, and probabilities.
+    """
     flat_labels_for_group = [l for l in flat_labels if label_to_group[l] == group]
     choice_key = int(group_probs.argmax().item())
     choice_label = flat_labels_for_group[choice_key]
@@ -96,16 +149,26 @@ def jev_choice_answer(
     }
 
 
-# ── Choice primitive (batched) ────────────────────────────────────────────────
+# -- Choice primitive (batched) ------------------------------------------------
+
+
 def adapt_choice(
     texts: list[str],
     hierarchical_labels: dict[str, list[str]],
     examples: list[dict] | None = None,
 ) -> list[dict]:
-    """GLiClass batched single-label → per-group renormalized TypeSafe Choice answers.
+    """Convert GLiClass batched single-label to per-group renormalized TypeSafe Choice answers.
 
     All texts share the same label set and are processed in a single GLiClass
     forward pass via the batch ``get_embeddings`` interface.
+
+    Args:
+        texts: List of input texts to classify.
+        hierarchical_labels: Dictionary mapping group names to lists of labels.
+        examples: Optional list of example dictionaries for few-shot learning.
+
+    Returns:
+        List of dictionaries containing flat_labels, flat_probabilities, and answers.
     """
     flat_labels, label_to_group = flatten_with_groups(hierarchical_labels)
     logits_list = get_logits(texts, flat_labels, examples=examples)
@@ -135,16 +198,26 @@ def adapt_choice(
     return answers
 
 
-# ── Noul primitive (binary yes/no, batched) ──────────────────────────────────
+# -- Noul primitive (binary yes/no, batched) ----------------------------------
+
+
 def adapt_noul(
     texts: list[str],
     instructions: str | list[str],
     examples: list[dict] | None = None,
 ) -> list[dict]:
-    """GLiClass batched binary classification → list of TypeSafe Noul answers.
+    """Convert GLiClass batched binary classification to TypeSafe Noul answers.
 
     All texts share the same labels (yes/no) and are processed in a single
     GLiClass forward pass via the batch ``get_embeddings`` interface.
+
+    Args:
+        texts: List of input texts to classify.
+        instructions: Single instruction string or list of instructions for each text.
+        examples: Optional list of example dictionaries for few-shot learning.
+
+    Returns:
+        List of dictionaries containing type, noul, confidence, and probabilities.
     """
     labels = ["yes", "no"]
     if isinstance(instructions, str):
@@ -201,14 +274,16 @@ def _score_from_rank(
     return float(score), float(probs.max())
 
 
-# ── Score primitive (ordered categorical, batched) ────────────────────────────
+# -- Score primitive (ordered categorical, batched) ----------------------------
+
+
 def adapt_score(
     texts: list[str],
     instructions: str | list[str],
     criteria: list[str],
     examples: list[dict] | None = None,
 ) -> list[dict]:
-    """GLiClass batched ordinal classification → list of TypeSafe Score answers.
+    """Convert GLiClass batched ordinal classification to TypeSafe Score answers.
 
     All texts share the same labels (criteria) and are processed in a single
     GLiClass forward pass via the batch ``get_embeddings`` interface.
@@ -216,6 +291,15 @@ def adapt_score(
     The ordinal score is a **fractional** value computed via reciprocal-rank
     weighting: the most probable level (rank 1) gets weight 1, the next
     (rank 2) gets weight 1/2, etc., each multiplied by its probability.
+
+    Args:
+        texts: List of input texts to classify.
+        instructions: Single instruction string or list of instructions for each text.
+        criteria: List of ordered criteria/levels for scoring.
+        examples: Optional list of example dictionaries for few-shot learning.
+
+    Returns:
+        List of dictionaries containing type, score, confidence, legend, and probabilities.
     """
     labels = criteria  # e.g. ["Calm", "Frustrated", "Very angry"]
     if isinstance(instructions, str):
@@ -241,7 +325,9 @@ def adapt_score(
     return answers
 
 
-# ── Unified Jev API (fully batched in one forward pass) ──────────────────────
+# -- Unified Jev API (fully batched in one forward pass) ----------------------
+
+
 def jev_api(
     texts: list[str],
     questions: dict[str, dict],
@@ -252,14 +338,15 @@ def jev_api(
     All texts and ALL questions are batched into a SINGLE GLiClass forward pass
     via the batch ``get_embeddings`` interface with hierarchical labels.
 
-    Request shape:
-        {
-            "texts": [str, ...],                   # one or more input texts
-            "questions": {                          # named questions
+    Args:
+        texts: List of input texts to classify.
+        questions: Dictionary of named questions with type, instructions, and criteria.
+            Example structure:
+            {
                 "department": {
                     "type": "choice",
                     "instructions": str,
-                    "criteria": {"key": "desc", ...}   # hierarchical labels
+                    "criteria": {"key": "desc", ...}  # hierarchical labels
                 },
                 "is_urgent": {
                     "type": "noul",
@@ -271,9 +358,10 @@ def jev_api(
                     "criteria": ["level 0", "level 1", ...]
                 }
             }
-        }
+        examples: Optional list of example dictionaries for few-shot learning.
 
-    Response shape (one answer dict per input text):
+    Returns:
+        List of answer dictionaries, one per input text, with structure:
         [
             {
                 "model": "jev-local",
@@ -395,14 +483,14 @@ def jev_api(
     return [{"model": "jev-local", "answers": answers} for answers in per_text_answers]
 
 
-# ── run ───────────────────────────────────────────────────────────────────────
+# -- run ----------------------------------------------------------------------─
 def main() -> None:
-    # ── Batched texts (one GLiClass forward pass per question type) ─────────
+    # -- Batched texts (one GLiClass forward pass per question type) --------─
     texts = [
         "Hi, I've been trying to connect my Stripe account for 3 days and the integration keeps failing. I'm losing sales. Please help ASAP.",
     ]
 
-    # ── Unified Jev API (batched — all texts per question type) ─────────────
+    # -- Unified Jev API (batched — all texts per question type) ------------─
     print("\n--- Unified Jev API (batched inference) ---")
     api_results = jev_api(
         texts=texts,
