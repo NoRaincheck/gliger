@@ -96,79 +96,61 @@ def jev_choice_answer(
     }
 
 
-# ── Choice primitive (existing) ───────────────────────────────────────────────
+# ── Choice primitive (batched) ────────────────────────────────────────────────
 def adapt_choice(
-    text: str,
+    texts: list[str],
     hierarchical_labels: dict[str, list[str]],
     examples: list[dict] | None = None,
-) -> dict:
-    """GLiClass single-label → per-group renormalized TypeSafe Choice answers."""
+) -> list[dict]:
+    """GLiClass batched single-label → per-group renormalized TypeSafe Choice answers.
+
+    All texts share the same label set and are processed in a single GLiClass
+    forward pass via the batch ``get_embeddings`` interface.
+    """
     flat_labels, label_to_group = flatten_with_groups(hierarchical_labels)
-    logits = get_logits(text, flat_labels, examples=examples)
+    logits_list = get_logits(texts, flat_labels, examples=examples)
 
-    # Global flat distribution
-    flat_probs = softmax(logits)
+    answers: list[dict] = []
+    for logits in logits_list:
+        flat_probs = softmax(logits)
+        group_rescales = per_group_rescale(logits, flat_labels, label_to_group)
 
-    # Per-group renormalized distributions
-    group_rescales = per_group_rescale(logits, flat_labels, label_to_group)
+        group_answers: dict[str, dict] = {}
+        for group in hierarchical_labels:
+            group_answers[group] = jev_choice_answer(
+                group, group_rescales[group], flat_labels, label_to_group
+            )
 
-    # TypeSafe Choice-shaped answers per group
-    answers: dict[str, dict] = {}
-    for group in hierarchical_labels:
-        answers[group] = jev_choice_answer(
-            group, group_rescales[group], flat_labels, label_to_group
+        answers.append(
+            {
+                "flat_labels": flat_labels,
+                "flat_probabilities": {
+                    flat_labels[i]: float(flat_probs[i])
+                    for i in range(len(flat_labels))
+                },
+                "answers": group_answers,
+            }
         )
 
-    return {
-        "flat_labels": flat_labels,
-        "flat_probabilities": {
-            flat_labels[i]: float(flat_probs[i]) for i in range(len(flat_labels))
-        },
-        "answers": answers,
-    }
+    return answers
 
 
-# ── Noul primitive (binary yes/no) ───────────────────────────────────────────
+# ── Noul primitive (binary yes/no, batched) ──────────────────────────────────
 def adapt_noul(
-    text: str,
-    instructions: str,
+    texts: list[str],
+    instructions: str | list[str],
     examples: list[dict] | None = None,
-) -> dict:
-    """GLiClass binary classification → TypeSafe Noul answer.
+) -> list[dict]:
+    """GLiClass batched binary classification → list of TypeSafe Noul answers.
 
-    Uses batch inference with a single text → single yes/no result.
+    All texts share the same labels (yes/no) and are processed in a single
+    GLiClass forward pass via the batch ``get_embeddings`` interface.
     """
     labels = ["yes", "no"]
-    prompt = instructions  # e.g. "Does this message express urgency?"
+    if isinstance(instructions, str):
+        instructions = [instructions] * len(texts)
 
-    logits = get_logits(text, labels, prompt=prompt, examples=examples)
-    probs = softmax(logits)
-
-    yes_prob = float(probs[0])  # index 0 = "yes"
-    noul = 1.0 if yes_prob >= 0.5 else 0.0
-    confidence = float(probs.max())
-
-    return {
-        "type": "noul",
-        "noul": noul,
-        "confidence": confidence,
-        "probabilities": {
-            "yes": float(probs[0]),
-            "no": float(probs[1]),
-        },
-    }
-
-
-def adapt_noul_batch(
-    texts: list[str],
-    instructions: str,
-    examples: list[dict] | None = None,
-) -> dict:
-    """Batch GLiClass inference for multiple texts → list of Noul answers."""
-    labels = ["yes", "no"]
-    prompts = [instructions] * len(texts)
-
-    logits_list = get_logits(texts, labels, prompt=prompts, examples=examples)
+    logits_list = get_logits(texts, labels, prompt=instructions, examples=examples)
 
     answers = []
     for logits in logits_list:
@@ -188,55 +170,26 @@ def adapt_noul_batch(
             }
         )
 
-    return {"answers": answers}
+    return answers
 
 
-# ── Score primitive (ordered categorical) ─────────────────────────────────────
+# ── Score primitive (ordered categorical, batched) ───────────────────────────
 def adapt_score(
-    text: str,
-    instructions: str,
+    texts: list[str],
+    instructions: str | list[str],
     criteria: list[str],
     examples: list[dict] | None = None,
-) -> dict:
-    """GLiClass ordinal classification → TypeSafe Score answer.
+) -> list[dict]:
+    """GLiClass batched ordinal classification → list of TypeSafe Score answers.
 
-    Each criterion level gets a numeric index 0..N-1.
-    Returns score (index of max prob), legend, and per-level probabilities.
+    All texts share the same labels (criteria) and are processed in a single
+    GLiClass forward pass via the batch ``get_embeddings`` interface.
     """
     labels = criteria  # e.g. ["Calm", "Frustrated", "Very angry"]
-    prompt = instructions
+    if isinstance(instructions, str):
+        instructions = [instructions] * len(texts)
 
-    logits = get_logits(text, labels, prompt=prompt, examples=examples)
-    probs = softmax(logits)
-
-    score_idx = int(probs.argmax().item())
-    score = float(score_idx)
-    confidence = float(probs.max())
-
-    # legend: {"0": "Calm, just stating facts", "1": "Frustrated but civil", ...}
-    legend = {str(i): level for i, level in enumerate(criteria)}
-    probabilities = {str(i): float(probs[i]) for i in range(len(probs))}
-
-    return {
-        "type": "score",
-        "score": score,
-        "confidence": confidence,
-        "legend": legend,
-        "probabilities": probabilities,
-    }
-
-
-def adapt_score_batch(
-    texts: list[str],
-    instructions: str,
-    criteria: list[str],
-    examples: list[dict] | None = None,
-) -> dict:
-    """Batch GLiClass inference for multiple texts → list of Score answers."""
-    labels = criteria
-    prompts = [instructions] * len(texts)
-
-    logits_list = get_logits(texts, labels, prompt=prompts, examples=examples)
+    logits_list = get_logits(texts, labels, prompt=instructions, examples=examples)
     legend = {str(i): level for i, level in enumerate(criteria)}
 
     answers = []
@@ -253,20 +206,23 @@ def adapt_score_batch(
             }
         )
 
-    return {"answers": answers}
+    return answers
 
 
-# ── Unified Jev API (TypeSafe contract) ──────────────────────────────────────
+# ── Unified Jev API (TypeSafe contract, batched) ─────────────────────────────
 def jev_api(
-    state: str,
+    texts: list[str],
     questions: dict[str, dict],
     examples: list[dict] | None = None,
-) -> dict:
+) -> list[dict]:
     """Unified entry point matching the Typesafe API request/response contract.
+
+    All texts for a given question type are batched into a single GLiClass
+    forward pass via the batch ``get_embeddings`` interface.
 
     Request shape:
         {
-            "state": str,                          # input text
+            "texts": [str, ...],                   # one or more input texts
             "questions": {                          # named questions
                 "department": {
                     "type": "choice",
@@ -285,17 +241,21 @@ def jev_api(
             }
         }
 
-    Response shape:
-        {
-            "model": "jev-local",
-            "answers": {
-                "department": {"type": "choice", "choice": "...", ...},
-                "is_urgent": {"type": "noul", "noul": 1.0, ...},
-                "frustration": {"type": "score", "score": 1.0, ...}
-            }
-        }
+    Response shape (one answer dict per input text):
+        [
+            {
+                "model": "jev-local",
+                "answers": {
+                    "department": {"type": "choice", "choice": "...", ...},
+                    "is_urgent": {"type": "noul", "noul": 1.0, ...},
+                    "frustration": {"type": "score", "score": 1.0, ...}
+                }
+            },
+            ...
+        ]
     """
-    answers: dict[str, dict] = {}
+    # Build per-text answer dicts
+    per_text_answers: list[dict[str, dict]] = [{} for _ in texts]
 
     for name, question in questions.items():
         q_type = question["type"]
@@ -305,41 +265,53 @@ def jev_api(
         if q_type == "choice":
             # Convert flat dict {label: desc} to hierarchical {group: [labels]}
             if isinstance(criteria, dict):
-                choice_labels = list(criteria.keys())
-                hierarchical = {name: choice_labels}
+                hierarchical = {name: list(criteria.keys())}
             else:
                 hierarchical = criteria
-            result = adapt_choice(state, hierarchical, examples)
-            answers[name] = result["answers"].get(name, {})
-            # Flatten the dot-notation label names back to bare labels
-            if answers[name]:
-                flat_probs = {
-                    k.split(".")[-1]: v
-                    for k, v in answers[name].get("probabilities", {}).items()
-                }
-                answers[name]["probabilities"] = flat_probs
-                answers[name]["choice"] = answers[name]["choice"].split(".")[-1]
+
+            results = adapt_choice(texts, hierarchical, examples)
+            for i, result in enumerate(results):
+                ans = result["answers"].get(name, {})
+                # Flatten the dot-notation label names back to bare labels
+                if ans:
+                    flat_probs = {
+                        k.split(".")[-1]: v
+                        for k, v in ans.get("probabilities", {}).items()
+                    }
+                    ans["probabilities"] = flat_probs
+                    ans["choice"] = ans["choice"].split(".")[-1]
+                per_text_answers[i][name] = ans
+
         elif q_type == "noul":
-            answers[name] = adapt_noul(state, instructions, examples)
+            batch_answers = adapt_noul(texts, instructions, examples)
+            for i, ans in enumerate(batch_answers):
+                per_text_answers[i][name] = ans
+
         elif q_type == "score":
-            answers[name] = adapt_score(state, instructions, criteria, examples)
+            # Convert flat dict {label: desc} → list of keys
+            if isinstance(criteria, dict):
+                criteria = list(criteria.keys())
+            batch_answers = adapt_score(texts, instructions, criteria, examples)
+            for i, ans in enumerate(batch_answers):
+                per_text_answers[i][name] = ans
+
         else:
             raise ValueError(f"Unknown question type: {q_type}")
 
-    return {
-        "model": "jev-local",
-        "answers": answers,
-    }
+    return [{"model": "jev-local", "answers": answers} for answers in per_text_answers]
 
 
 # ── run ───────────────────────────────────────────────────────────────────────
 def main() -> None:
-    state = "Hi, I've been trying to connect my Stripe account for 3 days and the integration keeps failing. I'm losing sales. Please help ASAP."
+    # ── Batched texts (one GLiClass forward pass per question type) ─────────
+    texts = [
+        "Hi, I've been trying to connect my Stripe account for 3 days and the integration keeps failing. I'm losing sales. Please help ASAP.",
+    ]
 
-    # ── Unified Jev API ─────────────────────────────────────────────────────
-    print("\n--- Unified Jev API (all three primitives) ---")
-    api_result = jev_api(
-        state=state,
+    # ── Unified Jev API (batched — all texts per question type) ─────────────
+    print("\n--- Unified Jev API (batched inference) ---")
+    api_results = jev_api(
+        texts=texts,
         questions={
             "department": {
                 "type": "choice",
@@ -366,17 +338,21 @@ def main() -> None:
         },
     )
 
-    for name, answer in api_result["answers"].items():
-        print(f"\n  [{name}]")
-        if answer["type"] == "choice":
-            print(f"  choice:     {answer['choice']}")
-            print(f"  confidence: {answer['confidence']:.4f}")
-        elif answer["type"] == "noul":
-            print(f"  noul:       {answer['noul']}")
-            print(f"  confidence: {answer['confidence']:.4f}")
-        elif answer["type"] == "score":
-            print(f"  score:      {answer['score']}")
-            print(f"  confidence: {answer['confidence']:.4f}")
+    for text_idx, result in enumerate(api_results):
+        print(f"\n  --- Text {text_idx + 1} ---")
+        for name, answer in result["answers"].items():
+            if answer["type"] == "choice":
+                print(
+                    f"  [{name}] choice={answer['choice']}, confidence={answer['confidence']:.4f}"
+                )
+            elif answer["type"] == "noul":
+                print(
+                    f"  [{name}] noul={answer['noul']}, confidence={answer['confidence']:.4f}"
+                )
+            elif answer["type"] == "score":
+                print(
+                    f"  [{name}] score={answer['score']}, confidence={answer['confidence']:.4f}"
+                )
 
     print()
     print("=" * 60)

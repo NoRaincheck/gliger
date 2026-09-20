@@ -1,0 +1,1 @@
+this project uses `uv` for python envvar management (i.e. `uv run python`)
