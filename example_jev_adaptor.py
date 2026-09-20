@@ -173,7 +173,35 @@ def adapt_noul(
     return answers
 
 
-# ── Score primitive (ordered categorical, batched) ───────────────────────────
+def _score_from_rank(
+    probs: torch.Tensor,
+) -> tuple[float, float]:
+    """Compute a fractional ordinal score from a tensor of class probabilities.
+
+    Ranks classes by probability (descending), then computes a weighted
+    score where each level index is weighted by its rank-adjusted
+    probability contribution. Confidence is the maximum class probability.
+
+    Args:
+        probs: 1-D tensor of softmax probabilities for ordered levels.
+
+    Returns:
+        A tuple of (fractional_score, confidence) both as Python floats.
+    """
+    ranked = sorted(enumerate(probs.tolist()), key=lambda x: x[1], reverse=True)
+    weighted_sum = 0.0
+    score = 0.0
+    for level_idx, prob in ranked:
+        weight = level_idx * prob
+        weighted_sum += weight
+        current_weight_prop = weight / weighted_sum
+
+        score = level_idx * (current_weight_prop) + score * (1 - current_weight_prop)
+
+    return float(score), float(probs.max())
+
+
+# ── Score primitive (ordered categorical, batched) ────────────────────────────
 def adapt_score(
     texts: list[str],
     instructions: str | list[str],
@@ -184,6 +212,10 @@ def adapt_score(
 
     All texts share the same labels (criteria) and are processed in a single
     GLiClass forward pass via the batch ``get_embeddings`` interface.
+
+    The ordinal score is a **fractional** value computed via reciprocal-rank
+    weighting: the most probable level (rank 1) gets weight 1, the next
+    (rank 2) gets weight 1/2, etc., each multiplied by its probability.
     """
     labels = criteria  # e.g. ["Calm", "Frustrated", "Very angry"]
     if isinstance(instructions, str):
@@ -195,12 +227,12 @@ def adapt_score(
     answers = []
     for logits in logits_list:
         probs = softmax(logits)
-        score_idx = int(probs.argmax().item())
+        score, confidence = _score_from_rank(probs)
         answers.append(
             {
                 "type": "score",
-                "score": float(score_idx),
-                "confidence": float(probs.max()),
+                "score": score,
+                "confidence": confidence,
                 "legend": legend,
                 "probabilities": {str(i): float(probs[i]) for i in range(len(probs))},
             }
@@ -345,12 +377,11 @@ def jev_api(
                 }
 
             elif q_type == "score":
-                score_idx = int(group_probs.argmax().item())
+                score, confidence = _score_from_rank(group_probs)
                 probs = {str(i): float(group_probs[i]) for i in range(len(group_probs))}
-                confidence = float(group_probs.max())
                 text_answers[name] = {
                     "type": "score",
-                    "score": float(score_idx),
+                    "score": score,
                     "confidence": confidence,
                     "legend": {
                         str(i): hierarchical_labels[name][i]
@@ -414,7 +445,7 @@ def main() -> None:
                 )
             elif answer["type"] == "score":
                 print(
-                    f"  [{name}] score={answer['score']}, confidence={answer['confidence']:.4f}"
+                    f"  [{name}] score={answer['score']:.4f}, confidence={answer['confidence']:.4f}"
                 )
 
     print()
